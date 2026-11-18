@@ -1,0 +1,858 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless batch and instant debit with CloudWatch alarms
+
+Parameters:
+  # 実リソースの名前はすべてパラメーターで受け取る（値は台帳で管理するランダム名）
+  AlarmTopicName: {Type: String}
+  ScheduleGroupName: {Type: String}
+  ScheduleName: {Type: String}
+  StateMachineName: {Type: String}
+  StateMachineLogGroupName: {Type: String}
+  WorkQueueName: {Type: String}
+  WorkDlqName: {Type: String}
+  SchedulerDlqName: {Type: String}
+  PrepareFunctionName: {Type: String}
+  WorkerFunctionName: {Type: String}
+  DebitFunctionName: {Type: String}
+  AccountsTableName: {Type: String}
+  IdempotencyTableName: {Type: String}
+  ApiName: {Type: String}
+  StageName: {Type: String}
+  FisConfigBucketName: {Type: String}
+  PrepareRoleName: {Type: String}
+  WorkerRoleName: {Type: String}
+  DebitRoleName: {Type: String}
+  StateMachineRoleName: {Type: String}
+  SchedulerRoleName: {Type: String}
+  FisRoleName: {Type: String}
+  FailedExecutionRuleName: {Type: String}
+  DashboardName: {Type: String}
+  AlarmSchedulerTargetError: {Type: String}
+  AlarmSchedulerDropped: {Type: String}
+  AlarmSfnUnsuccessful: {Type: String}
+  AlarmHeartbeat: {Type: String}
+  AlarmWorkDlq: {Type: String}
+  AlarmQueueAge: {Type: String}
+  AlarmWorkerErrors: {Type: String}
+  AlarmRuleFailedInvocations: {Type: String}
+  AlarmApi5xx: {Type: String}
+  AlarmApiLatency: {Type: String}
+  AlarmDebitErrors: {Type: String}
+  AlarmDebitThrottles: {Type: String}
+  AlarmDebitDuration: {Type: String}
+  AlarmDdbSystemErrors: {Type: String}
+  AlarmDdbThrottled: {Type: String}
+  AlarmDuplicateAttempts: {Type: String}
+  AlarmPayloadMismatch: {Type: String}
+  AlarmDebitComposite: {Type: String}
+  # デプロイしたコミット。障害の調査でどの変更が出たかをたどる手がかりにする
+  GitCommit:
+    Type: String
+    Default: unknown
+  # 本番は毎日2時の cron(0 2 * * ? *) と 86400 秒。検証では5分ごとにして挙動を早く確かめる
+  BatchScheduleExpression:
+    Type: String
+    Default: cron(0 2 * * ? *)
+  HeartbeatPeriodSeconds:
+    Type: Number
+    Default: 86400
+    AllowedValues: [60, 300, 3600, 86400, 604800]
+
+Globals:
+  Function:
+    Runtime: python3.14
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 10
+    LoggingConfig:
+      LogFormat: JSON
+    Layers:
+      - "{{resolve:ssm:/aws/service/powertools/python/arm64/python3.14/latest}}"
+
+Resources:
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Ref AlarmTopicName
+
+  # ---------- 構成A: 夜間バッチ ----------
+  WorkDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref WorkDlqName
+      MessageRetentionPeriod: 1209600
+
+  WorkQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref WorkQueueName
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WorkDlq.Arn
+        # 3回受け取って失敗したらDLQへ移す
+        maxReceiveCount: 3
+
+  SchedulerDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref SchedulerDlqName
+
+  PrepareRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref PrepareRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: send-work
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - {Effect: Allow, Action: sqs:SendMessage, Resource: !GetAtt WorkQueue.Arn}
+
+  PrepareFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref PrepareFunctionName
+      CodeUri: src/prepare/
+      Handler: app.handler
+      Role: !GetAtt PrepareRole.Arn
+      Environment:
+        Variables:
+          WORK_QUEUE_URL: !Ref WorkQueue
+
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref WorkerRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref WorkerFunctionName
+      CodeUri: src/worker/
+      Handler: app.handler
+      Role: !GetAtt WorkerRole.Arn
+      Events:
+        Work:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt WorkQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref StateMachineLogGroupName
+      RetentionInDays: 7
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref StateMachineRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: states.amazonaws.com}, Action: sts:AssumeRole}
+      Policies:
+        - PolicyName: batch
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - {Effect: Allow, Action: lambda:InvokeFunction, Resource: !GetAtt PrepareFunction.Arn}
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals: {"cloudwatch:namespace": NightlyBatch}
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+
+  BatchStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Ref StateMachineName
+      Type: STANDARD
+      Role: !GetAtt StateMachineRole.Arn
+      Logging:
+        Level: ERROR
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      Definition:
+        QueryLanguage: JSONata
+        StartAt: Prepare
+        TimeoutSeconds: 900
+        States:
+          Prepare:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Arguments:
+              FunctionName: !GetAtt PrepareFunction.Arn
+              Payload: "{% $states.input %}"
+            Output: "{% $states.result.Payload %}"
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException]
+                MaxAttempts: 2
+            Next: Heartbeat
+          # 最後まで進んだときだけ完了のハートビートを1つ送る
+          Heartbeat:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:cloudwatch:putMetricData
+            Arguments:
+              Namespace: NightlyBatch
+              MetricData:
+                - MetricName: BatchCompleted
+                  Dimensions:
+                    - {Name: Job, Value: nightly-interest}
+                  Value: 1
+                  Unit: Count
+            End: true
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref SchedulerRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: scheduler.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: {"aws:SourceAccount": !Ref AWS::AccountId}
+      Policies:
+        - PolicyName: start
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - {Effect: Allow, Action: states:StartExecution, Resource: !Ref BatchStateMachine}
+              - {Effect: Allow, Action: sqs:SendMessage, Resource: !GetAtt SchedulerDlq.Arn}
+
+  # スケジューラのメトリクスはスケジュールグループ単位でしか分からないので、バッチ専用のグループを作る
+  BatchScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Ref ScheduleGroupName
+
+  BatchSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Ref ScheduleName
+      GroupName: !Ref BatchScheduleGroup
+      ScheduleExpression: !Ref BatchScheduleExpression
+      ScheduleExpressionTimezone: Asia/Tokyo
+      FlexibleTimeWindow: {Mode: "OFF"}
+      Target:
+        Arn: !Ref BatchStateMachine
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"items": 20, "poison": 0}'
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 3600
+        DeadLetterConfig:
+          Arn: !GetAtt SchedulerDlq.Arn
+
+  # 失敗した実行の ARN をそのまま通知へ載せるため、状態変化のイベントも拾う
+  FailedExecutionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Ref FailedExecutionRuleName
+      EventPattern:
+        source: [aws.states]
+        detail-type: [Step Functions Execution Status Change]
+        detail:
+          status: [FAILED, TIMED_OUT, ABORTED]
+          stateMachineArn: [!Ref BatchStateMachine]
+      Targets:
+        - Id: alarm-topic
+          Arn: !Ref AlarmTopic
+
+  AlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlarmTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowFailedExecutionRule
+            Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              ArnEquals: {"aws:SourceArn": !GetAtt FailedExecutionRule.Arn}
+          - Sid: AllowBudgets
+            Effect: Allow
+            Principal: {Service: budgets.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              StringEquals: {"aws:SourceAccount": !Ref AWS::AccountId}
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal: {Service: cloudwatch.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              StringEquals: {"aws:SourceAccount": !Ref AWS::AccountId}
+
+  # ---------- 構成B: 即時引き落とし ----------
+  AccountsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref AccountsTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref IdempotencyTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: id, AttributeType: S}
+      KeySchema:
+        - {AttributeName: id, KeyType: HASH}
+      TimeToLiveSpecification:
+        AttributeName: expiration
+        Enabled: true
+
+  FisConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref FisConfigBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  DebitRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref DebitRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: debit-tables
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:GetItem, dynamodb:DeleteItem, dynamodb:ConditionCheckItem]
+                Resource: [!GetAtt AccountsTable.Arn, !GetAtt IdempotencyTable.Arn]
+        - PolicyName: fis-config-read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt FisConfigBucket.Arn
+                Condition:
+                  StringLike: {"s3:prefix": ["FisConfigs/*"]}
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${FisConfigBucket.Arn}/FisConfigs/*"
+
+  DebitFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref DebitFunctionName
+      Description: !Sub "instant debit API (git commit ${GitCommit})"
+      CodeUri: src/debit/
+      Handler: app.handler
+      Role: !GetAtt DebitRole.Arn
+      Layers:
+        - "{{resolve:ssm:/aws/service/fis/lambda-extension/AWS-FIS-extension-arm64/1.x.x}}"
+      Environment:
+        Variables:
+          ACCOUNTS_TABLE: !Ref AccountsTable
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTable
+          POWERTOOLS_SERVICE_NAME: debit
+          APP_GIT_COMMIT: !Ref GitCommit
+          POWERTOOLS_METRICS_NAMESPACE: Payments
+          # FIS の Lambda 拡張が障害の設定を読みに行く場所
+          AWS_FIS_CONFIGURATION_LOCATION: !Sub "arn:aws:s3:::${FisConfigBucket}/FisConfigs/"
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/aws-fis/bootstrap
+          AWS_FIS_SLOW_POLL_INTERVAL_SECONDS: "10"
+      Events:
+        Debit:
+          Type: Api
+          Properties:
+            RestApiId: !Ref DebitApi
+            Path: /debits
+            Method: post
+
+  DebitApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Ref ApiName
+      StageName: !Ref StageName
+
+  FisRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref FisRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: fis.amazonaws.com}, Action: sts:AssumeRole}
+      Policies:
+        - PolicyName: lambda-faults
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - {Effect: Allow, Action: [s3:PutObject, s3:DeleteObject], Resource: !Sub "${FisConfigBucket.Arn}/FisConfigs/*"}
+              - {Effect: Allow, Action: [lambda:GetFunction, tag:GetResources], Resource: "*"}
+
+  # 引き落とし関数の呼び出しの半分を3分間エラーにする
+  FisInvocationError:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: debit invocation error 50 percent for 3 minutes
+      RoleArn: !GetAtt FisRole.Arn
+      StopConditions:
+        - Source: none
+      Targets:
+        debit:
+          ResourceType: aws:lambda:function
+          ResourceArns: [!GetAtt DebitFunction.Arn]
+          SelectionMode: ALL
+      Actions:
+        error:
+          ActionId: aws:lambda:invocation-error
+          Parameters:
+            duration: PT3M
+            invocationPercentage: "50"
+            preventExecution: "true"
+          Targets:
+            Functions: debit
+      Tags: {}
+
+  # 引き落とし関数の呼び出しへ1.5秒の遅延を足す
+  FisAddDelay:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: debit add 1500 ms delay for 6 minutes
+      RoleArn: !GetAtt FisRole.Arn
+      StopConditions:
+        - Source: none
+      Targets:
+        debit:
+          ResourceType: aws:lambda:function
+          ResourceArns: [!GetAtt DebitFunction.Arn]
+          SelectionMode: ALL
+      Actions:
+        delay:
+          ActionId: aws:lambda:invocation-add-delay
+          Parameters:
+            duration: PT6M
+            invocationPercentage: "100"
+            startupDelayMilliseconds: "1500"
+          Targets:
+            Functions: debit
+      Tags: {}
+
+  # ---------- アラーム ----------
+  SchedulerTargetErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmSchedulerTargetError
+      AlarmDescription: スケジューラがステートマシンの起動に失敗した
+      Namespace: AWS/Scheduler
+      MetricName: TargetErrorCount
+      Dimensions: [{Name: ScheduleGroup, Value: !Ref BatchScheduleGroup}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  SchedulerDroppedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmSchedulerDropped
+      AlarmDescription: 再試行を使い切り、スケジューラが起動をあきらめた
+      Namespace: AWS/Scheduler
+      MetricName: InvocationDroppedCount
+      Dimensions: [{Name: ScheduleGroup, Value: !Ref BatchScheduleGroup}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  SfnUnsuccessfulAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmSfnUnsuccessful
+      AlarmDescription: バッチの実行が失敗・タイムアウト・中断で終わった
+      Metrics:
+        - Id: failed
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/States
+              MetricName: ExecutionsFailed
+              Dimensions: [{Name: StateMachineArn, Value: !Ref BatchStateMachine}]
+            Period: 60
+            Stat: Sum
+        - Id: timedout
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/States
+              MetricName: ExecutionsTimedOut
+              Dimensions: [{Name: StateMachineArn, Value: !Ref BatchStateMachine}]
+            Period: 60
+            Stat: Sum
+        - Id: aborted
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/States
+              MetricName: ExecutionsAborted
+              Dimensions: [{Name: StateMachineArn, Value: !Ref BatchStateMachine}]
+            Period: 60
+            Stat: Sum
+        - Id: unsuccessful
+          Label: unsuccessful executions
+          Expression: FILL(failed, 0) + FILL(timedout, 0) + FILL(aborted, 0)
+          ReturnData: true
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # 「走らなかった」を拾う。暦日（東京）ごとに完了のハートビートが1つもなければ ALARM
+  HeartbeatAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmHeartbeat
+      AlarmDescription: 夜間バッチの完了が期間内に記録されなかった
+      Namespace: NightlyBatch
+      MetricName: BatchCompleted
+      Dimensions: [{Name: Job, Value: nightly-interest}]
+      Statistic: Sum
+      Period: !Ref HeartbeatPeriodSeconds
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      EvaluationWindow:
+        WallClockWindow:
+          Timezone: Asia/Tokyo
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  WorkDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmWorkDlq
+      AlarmDescription: 処理できなかったメッセージがDLQに残っている
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt WorkDlq.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  QueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmQueueAge
+      AlarmDescription: 作業キューの最も古いメッセージが10分以上滞留している
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions: [{Name: QueueName, Value: !GetAtt WorkQueue.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 5
+      Threshold: 600
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  WorkerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmWorkerErrors
+      AlarmDescription: 処理関数の呼び出しがエラーで終わった
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref WorkerFunction}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  RuleFailedInvocationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmRuleFailedInvocations
+      AlarmDescription: 実行失敗の通知ルールがSNSへ配信できなかった
+      Namespace: AWS/Events
+      MetricName: FailedInvocations
+      Dimensions: [{Name: RuleName, Value: !Ref FailedExecutionRule}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # 通知は複合アラームに任せる
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmApi5xx
+      AlarmDescription: 引き落としAPIの5XXエラー率が5%を超えた
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - {Name: ApiName, Value: !Ref ApiName}
+        - {Name: Stage, Value: !Ref StageName}
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 0.05
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # 通知は複合アラームに任せる
+  ApiLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmApiLatency
+      AlarmDescription: 引き落としAPIのp90レイテンシが1秒以上
+      Namespace: AWS/ApiGateway
+      MetricName: Latency
+      Dimensions:
+        - {Name: ApiName, Value: !Ref ApiName}
+        - {Name: Stage, Value: !Ref StageName}
+      ExtendedStatistic: p90
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: 1000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # 通知は複合アラームに任せる
+  DebitErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmDebitErrors
+      AlarmDescription: 引き落とし関数のエラー率が5%を超えた
+      Metrics:
+        - Id: errors
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions: [{Name: FunctionName, Value: !Ref DebitFunction}]
+            Period: 60
+            Stat: Sum
+        - Id: invocations
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Invocations
+              Dimensions: [{Name: FunctionName, Value: !Ref DebitFunction}]
+            Period: 60
+            Stat: Sum
+        - Id: errorrate
+          Label: error rate
+          Expression: IF(invocations > 0, errors / invocations, 0)
+          ReturnData: true
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 0.05
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  DebitThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmDebitThrottles
+      AlarmDescription: 引き落とし関数がスロットリングされた
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions: [{Name: FunctionName, Value: !Ref DebitFunction}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 5
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  DebitDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmDebitDuration
+      AlarmDescription: 引き落とし関数のp90実行時間がタイムアウト10秒の80%を超えた
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions: [{Name: FunctionName, Value: !Ref DebitFunction}]
+      ExtendedStatistic: p90
+      Period: 60
+      EvaluationPeriods: 15
+      DatapointsToAlarm: 15
+      Threshold: 8000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # SystemErrors は TableName と Operation の組でしか記録されない。Metrics Insights で全操作を合計する
+  # 通知は複合アラームに任せる
+  DdbSystemErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmDdbSystemErrors
+      AlarmDescription: 口座テーブルでDynamoDB側のエラー（HTTP 500）が出た
+      Metrics:
+        - Id: syserr
+          Label: SystemErrors all operations
+          Expression: !Sub "SELECT SUM(SystemErrors) FROM SCHEMA(\"AWS/DynamoDB\", Operation, TableName) WHERE TableName = '${AccountsTable}'"
+          Period: 60
+          ReturnData: true
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  DdbThrottledAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmDdbThrottled
+      AlarmDescription: 口座テーブルへの書き込みがスロットリングされた
+      Namespace: AWS/DynamoDB
+      MetricName: WriteThrottleEvents
+      Dimensions: [{Name: TableName, Value: !Ref AccountsTable}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 5
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # 重複した引き落としや残高不足で、条件付き書き込みが弾かれた回数
+  DuplicateAttemptsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmDuplicateAttempts
+      AlarmDescription: 口座テーブルで条件付き書き込みの失敗が5分で10回以上
+      Namespace: AWS/DynamoDB
+      MetricName: ConditionalCheckFailedRequests
+      Dimensions: [{Name: TableName, Value: !Ref AccountsTable}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  PayloadMismatchAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref AlarmPayloadMismatch
+      AlarmDescription: 同じ冪等キーで口座か金額が違う要求が届いた
+      Namespace: Payments
+      MetricName: IdempotencyPayloadMismatch
+      Dimensions: [{Name: service, Value: debit}]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # 引き落としの異常は1通にまとめて知らせる
+  DebitCompositeAlarm:
+    Type: AWS::CloudWatch::CompositeAlarm
+    Properties:
+      AlarmName: !Ref AlarmDebitComposite
+      AlarmDescription: 即時引き落としのどこかで異常が起きている
+      AlarmRule: !Sub "ALARM(\"${Api5xxAlarm}\") OR ALARM(\"${DebitErrorsAlarm}\") OR ALARM(\"${DdbSystemErrorsAlarm}\") OR ALARM(\"${ApiLatencyAlarm}\")"
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Ref DashboardName
+      DashboardBody: !Sub |
+        {"widgets":[
+         {"type":"alarm","x":0,"y":0,"width":24,"height":4,"properties":{"title":"アラームの状態","alarms":["${SfnUnsuccessfulAlarm.Arn}","${HeartbeatAlarm.Arn}","${WorkDlqAlarm.Arn}","${SchedulerDroppedAlarm.Arn}","${DebitCompositeAlarm.Arn}","${DuplicateAttemptsAlarm.Arn}","${PayloadMismatchAlarm.Arn}"]}},
+         {"type":"metric","x":0,"y":4,"width":8,"height":6,"properties":{"title":"バッチの実行","region":"${AWS::Region}","stat":"Sum","period":300,"metrics":[["AWS/States","ExecutionsSucceeded","StateMachineArn","${BatchStateMachine}"],[".","ExecutionsFailed",".","."],["NightlyBatch","BatchCompleted","Job","nightly-interest"]]}},
+         {"type":"metric","x":8,"y":4,"width":8,"height":6,"properties":{"title":"作業キューとDLQ","region":"${AWS::Region}","stat":"Maximum","period":60,"metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${WorkQueue.QueueName}"],["...","${WorkDlq.QueueName}"],[".","ApproximateAgeOfOldestMessage",".","${WorkQueue.QueueName}",{"yAxis":"right"}]]}},
+         {"type":"metric","x":16,"y":4,"width":8,"height":6,"properties":{"title":"スケジューラ","region":"${AWS::Region}","stat":"Sum","period":300,"metrics":[["AWS/Scheduler","InvocationAttemptCount","ScheduleGroup","${BatchScheduleGroup}"],[".","TargetErrorCount",".","."],[".","InvocationDroppedCount",".","."]]}},
+         {"type":"metric","x":0,"y":10,"width":8,"height":6,"properties":{"title":"引き落としAPI","region":"${AWS::Region}","stat":"Sum","period":60,"metrics":[["AWS/ApiGateway","Count","ApiName","${ApiName}","Stage","${StageName}"],[".","5XXError",".",".",".","."],[".","4XXError",".",".",".","."]]}},
+         {"type":"metric","x":8,"y":10,"width":8,"height":6,"properties":{"title":"レイテンシ p90","region":"${AWS::Region}","stat":"p90","period":60,"metrics":[["AWS/ApiGateway","Latency","ApiName","${ApiName}","Stage","${StageName}"],["AWS/Lambda","Duration","FunctionName","${DebitFunction}"]]}},
+         {"type":"metric","x":16,"y":10,"width":8,"height":6,"properties":{"title":"二重引き落としの兆候","region":"${AWS::Region}","stat":"Sum","period":60,"metrics":[["AWS/DynamoDB","ConditionalCheckFailedRequests","TableName","${AccountsTable}"],["Payments","IdempotencyPayloadMismatch","service","debit"],[".","DuplicateDebitBlocked",".","."],[".","InsufficientFunds",".","."]]}}
+        ]}
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${DebitApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/debits"
+  StateMachineArn:
+    Value: !Ref BatchStateMachine
+  FisInvocationErrorTemplate:
+    Value: !Ref FisInvocationError
+  FisAddDelayTemplate:
+    Value: !Ref FisAddDelay
