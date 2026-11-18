@@ -46,6 +46,11 @@ Parameters:
   AlarmDuplicateAttempts: {Type: String}
   AlarmPayloadMismatch: {Type: String}
   AlarmDebitComposite: {Type: String}
+  # true にすると、アクティブトレースと ADOT レイヤーで OpenTelemetry のスパンを送る
+  EnableOtel:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
   # デプロイしたコミット。障害の調査でどの変更が出たかをたどる手がかりにする
   GitCommit:
     Type: String
@@ -59,6 +64,9 @@ Parameters:
     Default: 86400
     AllowedValues: [60, 300, 3600, 86400, 604800]
 
+Conditions:
+  OtelOn: !Equals [!Ref EnableOtel, "true"]
+
 Globals:
   Function:
     Runtime: python3.14
@@ -67,8 +75,10 @@ Globals:
     Timeout: 10
     LoggingConfig:
       LogFormat: JSON
+    Tracing: !If [OtelOn, Active, PassThrough]
     Layers:
       - "{{resolve:ssm:/aws/service/powertools/python/arm64/python3.14/latest}}"
+      - !If [OtelOn, "arn:aws:lambda:ap-northeast-1:615299751070:layer:AWSOpenTelemetryDistroPython:30", !Ref AWS::NoValue]
 
 Resources:
   AlarmTopic:
@@ -108,6 +118,7 @@ Resources:
           - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
       Policies:
         - PolicyName: send-work
           PolicyDocument:
@@ -125,6 +136,7 @@ Resources:
       Environment:
         Variables:
           WORK_QUEUE_URL: !Ref WorkQueue
+          AWS_LAMBDA_EXEC_WRAPPER: !If [OtelOn, /opt/otel-instrument, !Ref AWS::NoValue]
 
   WorkerRole:
     Type: AWS::IAM::Role
@@ -136,6 +148,7 @@ Resources:
           - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
 
   WorkerFunction:
     Type: AWS::Serverless::Function
@@ -144,6 +157,9 @@ Resources:
       CodeUri: src/worker/
       Handler: app.handler
       Role: !GetAtt WorkerRole.Arn
+      Environment:
+        Variables:
+          AWS_LAMBDA_EXEC_WRAPPER: !If [OtelOn, /opt/otel-instrument, !Ref AWS::NoValue]
       Events:
         Work:
           Type: SQS
@@ -172,6 +188,7 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - {Effect: Allow, Action: lambda:InvokeFunction, Resource: !GetAtt PrepareFunction.Arn}
+              - {Effect: Allow, Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, xray:GetSamplingRules, xray:GetSamplingTargets], Resource: "*"}
               - Effect: Allow
                 Action: cloudwatch:PutMetricData
                 Resource: "*"
@@ -195,6 +212,8 @@ Resources:
       Name: !Ref StateMachineName
       Type: STANDARD
       Role: !GetAtt StateMachineRole.Arn
+      Tracing:
+        Enabled: !If [OtelOn, true, false]
       Logging:
         Level: ERROR
         IncludeExecutionData: false
@@ -363,6 +382,7 @@ Resources:
           - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
       Policies:
         - PolicyName: debit-tables
           PolicyDocument:
@@ -403,7 +423,8 @@ Resources:
           POWERTOOLS_METRICS_NAMESPACE: Payments
           # FIS の Lambda 拡張が障害の設定を読みに行く場所
           AWS_FIS_CONFIGURATION_LOCATION: !Sub "arn:aws:s3:::${FisConfigBucket}/FisConfigs/"
-          AWS_LAMBDA_EXEC_WRAPPER: /opt/aws-fis/bootstrap
+          # FIS の障害注入と ADOT の自動計装は同じラッパーの仕組みを使うので、どちらか一方にする
+          AWS_LAMBDA_EXEC_WRAPPER: !If [OtelOn, /opt/otel-instrument, /opt/aws-fis/bootstrap]
           AWS_FIS_SLOW_POLL_INTERVAL_SECONDS: "10"
       Events:
         Debit:
@@ -418,6 +439,7 @@ Resources:
     Properties:
       Name: !Ref ApiName
       StageName: !Ref StageName
+      TracingEnabled: !If [OtelOn, true, false]
 
   FisRole:
     Type: AWS::IAM::Role
