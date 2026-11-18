@@ -44,7 +44,7 @@ def debit(event, context):
     headers = {k.lower(): v for k, v in event["headers"].items()}
     key = headers["idempotency-key"]
     try:
-        dynamodb.transact_write_items(
+        result = dynamodb.transact_write_items(
             TransactItems=[
                 {
                     "Put": {
@@ -73,7 +73,9 @@ def debit(event, context):
         return response(409, {"result": "insufficient_funds"})
     metrics.add_metric(name="DebitSucceeded", unit=MetricUnit.Count, value=1)
     metrics.add_metric(name="DebitAmount", unit=MetricUnit.Count, value=amount)
-    return response(200, {"result": "debited", "accountId": account_id, "amount": amount})
+    # 引き落とし後の残高を応答に含める
+    balance = int(result["Attributes"]["balance"]["N"])
+    return response(200, {"result": "debited", "accountId": account_id, "amount": amount, "balance": balance})
 
 
 @metrics.log_metrics
